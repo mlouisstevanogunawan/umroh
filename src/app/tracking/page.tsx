@@ -7,12 +7,16 @@ import {
   CircleCheck,
   CircleDashed,
   CreditCard,
+  ExternalLink,
   PackageCheck,
+  RefreshCw,
   Search,
+  Sparkles,
   Users,
 } from "lucide-react";
 import { formatRupiah } from "@/lib/packages";
 import { getSupabase } from "@/lib/supabase";
+import { loadSnapScript, formatPaymentType } from "@/lib/midtrans";
 
 type TrackedBooking = {
   id: string;
@@ -40,6 +44,9 @@ export default function TrackingPage() {
   const [searched, setSearched] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [realtimeConnected, setRealtimeConnected] = useState(false);
+  const [isPaying, setIsPaying] = useState(false);
+  const [isCheckingMidtrans, setIsCheckingMidtrans] = useState(false);
+  const [midtransNotice, setMidtransNotice] = useState("");
 
   const fetchBooking = async (searchCode: string) => {
     const trimmed = searchCode.trim();
@@ -47,6 +54,7 @@ export default function TrackingPage() {
 
     setSearching(true);
     setErrorMessage("");
+    setMidtransNotice("");
     setSearched(true);
 
     const supabase = getSupabase();
@@ -189,6 +197,94 @@ export default function TrackingPage() {
     }
   }, [result]);
 
+  /**
+   * Pay or complete pending booking via Midtrans Snap popup
+   */
+  const handlePayNowMidtrans = async () => {
+    if (!result) return;
+    setIsPaying(true);
+    setMidtransNotice("");
+
+    try {
+      await loadSnapScript();
+
+      const res = await fetch("/api/midtrans/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bookingId: result.id,
+          packageId: result.details?.package_id || "annahl-umrah",
+          packageName: result.packageName,
+          amount: result.totalAmount,
+          customer: {
+            name: result.packageName.split("·")[0] || "Jemaah Umrah",
+          },
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.token) {
+        throw new Error(data.error || "Gagal membuat sesi pembayaran Midtrans.");
+      }
+
+      window.snap?.pay(data.token, {
+        onSuccess: async (snapRes) => {
+          console.log("Tracking Snap success:", snapRes);
+          setMidtransNotice("Pembayaran berhasil! Memverifikasi status pesanan...");
+          // Sync with server
+          await fetch(`/api/midtrans/status?order_id=${snapRes.order_id}`);
+          void fetchBooking(result.id);
+          setIsPaying(false);
+        },
+        onPending: async (snapRes) => {
+          console.log("Tracking Snap pending:", snapRes);
+          setMidtransNotice("Pembayaran sedang diproses. Silakan selesaikan tagihan Anda.");
+          await fetch(`/api/midtrans/status?order_id=${snapRes.order_id}`);
+          void fetchBooking(result.id);
+          setIsPaying(false);
+        },
+        onError: (snapRes) => {
+          console.error("Tracking Snap error:", snapRes);
+          setMidtransNotice("Pembayaran tidak berhasil atau dibatalkan.");
+          setIsPaying(false);
+        },
+        onClose: () => {
+          setIsPaying(false);
+        },
+      });
+    } catch (err) {
+      console.error("Pay now error:", err);
+      setMidtransNotice(err instanceof Error ? err.message : "Gagal membuka Midtrans.");
+      setIsPaying(false);
+    }
+  };
+
+  /**
+   * Sync and check latest Midtrans transaction status directly
+   */
+  const handleCheckMidtransStatus = async () => {
+    if (!result?.id) return;
+    setIsCheckingMidtrans(true);
+    setMidtransNotice("");
+    try {
+      const res = await fetch(`/api/midtrans/status?order_id=${result.id}`);
+      const data = await res.json();
+      if (res.ok && data.transaction_status) {
+        setMidtransNotice(
+          `Status Midtrans: ${data.transaction_status.toUpperCase()} (${data.payment_type || "Midtrans"}). Status pesanan kini: ${data.booking_status}`
+        );
+        void fetchBooking(result.id);
+      } else {
+        setMidtransNotice(data.error || "Belum ada transaksi Midtrans yang tercatat untuk kode ini.");
+      }
+    } catch (err) {
+      console.warn("Check status error:", err);
+      setMidtransNotice("Gagal menghubungi gateway Midtrans.");
+    } finally {
+      setIsCheckingMidtrans(false);
+    }
+  };
+
   return (
     <div className="page-width tracking-page">
       <div className="tracking-header">
@@ -317,11 +413,70 @@ export default function TrackingPage() {
                 </div>
               </div>
 
+              {/* Midtrans Payment Action Box (if status is Menunggu or Diproses) */}
+              {(result.status === "Menunggu" || result.status === "Diproses") && (
+                <div className="tracking-payment-action-box tab-fade-in">
+                  <div className="payment-action-header">
+                    <Sparkles size={18} className="text-gold" />
+                    <div>
+                      <b>Selesaikan Pembayaran via Midtrans Sandbox</b>
+                      <p className="small muted">
+                        Gunakan Virtual Account otomatis, QRIS, atau Kartu Kredit untuk verifikasi pembayaran secara instan tanpa perlu unggah bukti manual.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="payment-action-buttons">
+                    <button
+                      type="button"
+                      className="button button-primary button-small"
+                      disabled={isPaying}
+                      onClick={handlePayNowMidtrans}
+                    >
+                      <CreditCard size={15} />
+                      {isPaying ? "Menghubungkan Midtrans..." : `Bayar via Midtrans (${formatRupiah(result.totalAmount)})`}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="button button-outline button-small"
+                      disabled={isCheckingMidtrans}
+                      onClick={handleCheckMidtransStatus}
+                    >
+                      <RefreshCw size={14} className={isCheckingMidtrans ? "spin" : ""} />
+                      {isCheckingMidtrans ? "Memeriksa..." : "Cek Status Midtrans"}
+                    </button>
+
+                    <a
+                      href="https://simulator.sandbox.midtrans.com/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="simulator-mini-link"
+                    >
+                      <span>Simulator Sandbox</span>
+                      <ExternalLink size={12} />
+                    </a>
+                  </div>
+
+                  {midtransNotice && (
+                    <div className="tracking-midtrans-notice">
+                      <Sparkles size={14} />
+                      <span>{midtransNotice}</span>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Notes / Details */}
               {result.details && (
                 <div className="tracking-extra-details">
                   <b>Catatan Operasional Travel:</b>
                   <p>{String(result.details.notes || "Proses berjalan sesuai jadwal.")}</p>
+                  {Boolean(result.details.payment_type) && (
+                    <p className="small muted">
+                      Metode Pembayaran: <b>{formatPaymentType(String(result.details.payment_type))}</b>
+                    </p>
+                  )}
                 </div>
               )}
 
